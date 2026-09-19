@@ -54,7 +54,7 @@ import lever from './providers/lever.mjs';
 import ashby from './providers/ashby.mjs';
 import workday from './providers/workday.mjs';
 import icims from './providers/icims.mjs';
-import { buildTitleFilter, buildTitleFilterOverrides, buildTitleFilterWithOverrides, buildLocationFilter, buildContentFilter, matchedTitleKeywords, loadSeenUrls, normalizeUrlForDedup, appendToPipeline, appendToScanHistory, loadBlacklist, parseSinceDays, PORTALS_PATH, PIPELINE_PATH } from './scan.mjs';
+import { buildTitleFilter, buildTitleFilterOverrides, buildTitleFilterWithOverrides, buildLocationFilter, buildContentFilter, matchedTitleKeywords, loadSeenUrls, normalizeUrlForDedup, appendToPipeline, appendToScanHistory, loadBlacklist, loadAppliedCompanies, priorApplicationLabel, parseSinceDays, PORTALS_PATH, PIPELINE_PATH } from './scan.mjs';
 import { localToday } from './lib/local-today.mjs';
 import { printScanSummaryHeader } from './lib/scan-summary-marker.mjs';
 import { SEED_SOURCES, toPortalEntry } from './seeds/vc-portfolios.mjs';
@@ -458,6 +458,32 @@ export function filterBlacklistedOffers(offers, blacklist, { includeBlacklisted 
   return { offers: kept, filteredBlacklist, annotatedBlacklisted };
 }
 
+// Same annotate-never-filter contract as scan.mjs's inline check (see
+// loadAppliedCompanies() there for the reasoning). Applied as a flat-array
+// pass here to match this file's post-sweep filtering shape rather than
+// scan.mjs's inline per-company loop.
+export function annotatePriorApplications(offers, appliedCompanies) {
+  if (!appliedCompanies || appliedCompanies.size === 0) {
+    return { offers, annotatedPriorApplication: 0 };
+  }
+
+  let annotatedPriorApplication = 0;
+  const annotated = offers.map(offer => {
+    const label = priorApplicationLabel(offer.company, appliedCompanies);
+    if (!label) return offer;
+    annotatedPriorApplication++;
+    return {
+      ...offer,
+      priorApplication: true,
+      note: typeof offer.note === 'string' && offer.note.trim()
+        ? `${label} — ${offer.note}`
+        : label,
+    };
+  });
+
+  return { offers: annotated, annotatedPriorApplication };
+}
+
 // `title_filter` is written for scan.mjs, whose corpus is the curated
 // tracked_companies list. That corpus is what makes a broad keyword safe:
 // "Backend" at a company you already vetted is a real lead, and dropping it
@@ -772,6 +798,7 @@ async function main() {
     extraTokensFor: (url, portal) => providerForSource(portal)?.dedupKey?.({ url }),
   });
   const blacklist = loadBlacklist();
+  const appliedCompanies = loadAppliedCompanies();
   // sinceMs and includeUndated let providers (currently only workday.mjs)
   // stop paginating a tenant early instead of always walking to max_pages:
   // sinceMs once postings are confidently past the --since window, and
@@ -1104,7 +1131,8 @@ async function main() {
   }
 
   const blacklistResult = filterBlacklistedOffers(newOffers, blacklist, { includeBlacklisted: opts.includeBlacklisted });
-  let offers = blacklistResult.offers;
+  const priorApplicationResult = annotatePriorApplications(blacklistResult.offers, appliedCompanies);
+  let offers = priorApplicationResult.offers;
   if (offers.length && opts.liveness) offers = await filterLive(offers);
   offers.sort((a, b) => (b.postedAt || 0) - (a.postedAt || 0));
 
@@ -1136,6 +1164,9 @@ async function main() {
     }
   }
   if (droppedContent) log(`Content-filtered:   ${droppedContent}`);
+  if (appliedCompanies.size > 0 && priorApplicationResult.annotatedPriorApplication > 0) {
+    log(`Prior application:  ${priorApplicationResult.annotatedPriorApplication} annotated (see note: in pipeline.md)`);
+  }
   log(`New matches:        ${offers.length}`);
 
   if (offers.length) {
@@ -1143,7 +1174,8 @@ async function main() {
     for (const o of offers) {
       const posted = o.postedAt ? new Date(o.postedAt).toISOString().slice(0, 10) : 'n/a';
       const blacklistSuffix = o.blacklisted ? ' [BLACKLISTED — on your do-not-apply list]' : '';
-      log(`  + [${o.source}] ${posted} | ${o.company} | ${o.title} | ${o.location || 'N/A'}${blacklistSuffix}\n    ${o.url}`);
+      const priorApplicationSuffix = o.priorApplication ? ' [PRIOR APPLICATION — see note]' : '';
+      log(`  + [${o.source}] ${posted} | ${o.company} | ${o.title} | ${o.location || 'N/A'}${blacklistSuffix}${priorApplicationSuffix}\n    ${o.url}`);
     }
   }
 

@@ -64,7 +64,7 @@ import { loadProviders, resolveProvider } from './providers/_registry.mjs';
 import { mergeProviderPlugins } from './plugins/_engine.mjs';
 import { classifyFetchError } from './verify-portals.mjs';
 import { fingerprintText, findCrossListings } from './fingerprint-core.mjs';
-import { resolveColumns, parseTrackerRow, normalizeTextKey } from './tracker-parse.mjs';
+import { resolveColumns, parseTrackerRow, normalizeTextKey, extractTrackerReportNumbers } from './tracker-parse.mjs';
 import { normalizeCompany } from './tracker-utils.mjs';
 import { normalizeCompanyName } from './invite-match.mjs';
 import { withPipelineLock } from './pipeline-lock.mjs';
@@ -88,7 +88,7 @@ try {
 const parseYaml = yaml.load;
 
 // ── Config ──────────────────────────────────────────────────────────
-import { getCareerOpsRoot } from './path-resolver.mjs';
+import { getCareerOpsRoot, resolveTrackerPath } from './path-resolver.mjs';
 const CODE_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DATA_ROOT = getCareerOpsRoot();
 
@@ -2513,6 +2513,77 @@ export function loadBlacklist(filePath = BLACKLIST_PATH) {
   return parseBlacklist(readFileSync(filePath, 'utf-8'));
 }
 
+// ── Prior-application cross-check ───────────────────────────────────
+
+// Motivated by a real morning-triage run (2026-09-19) where two postings
+// from companies with an existing tracker row scored a plain YAY: the fit
+// checklist has no way to know "I already applied here." Unlike blacklist.md
+// this never filters anything out — a second req at a company you've applied
+// to before is often still worth pursuing — it only annotates, the same way
+// a labeled `note:` segment already rides through formatPipelineOffer.
+//
+// Keyed with the same normalizeCompany() every other tracker consumer shares
+// (#1460), so "Acme Corp." in the tracker still matches "acme corp" from an
+// ATS feed. Multiple rows for one company are all kept (most recent first)
+// so the annotation can say how many, not just that one exists.
+
+/**
+ * Parse applications.md into a per-company history for the prior-application
+ * annotation below. Header/separator rows and rows with no company cell are
+ * skipped. Absent/empty tracker = empty Map = no-op, same contract as
+ * loadBlacklist.
+ *
+ * @param {string} [filePath] - Override for tests; defaults to the resolved
+ *   canonical tracker path (data/applications.md or the CAREER_OPS_TRACKER
+ *   override), so this follows the data root the same way every other input
+ *   in this file does (#3510).
+ * @returns {Map<string, {company: string, rows: Array<{num: number, role: string, status: string, report: string}>}>}
+ */
+export function loadAppliedCompanies(filePath = resolveTrackerPath(DATA_ROOT)) {
+  const entries = new Map();
+  if (!existsSync(filePath)) return entries;
+
+  const lines = readFileSync(filePath, 'utf-8').replace(/\r/g, '').split('\n');
+  const colmap = resolveColumns(lines);
+
+  for (const line of lines) {
+    const row = parseTrackerRow(line, colmap);
+    if (!row || !row.company) continue;
+    const key = normalizeCompany(row.company);
+    if (!key) continue;
+    const entry = entries.get(key) ?? { company: row.company, rows: [] };
+    entry.rows.push({ num: row.num, role: row.role, status: row.status, report: row.report });
+    entries.set(key, entry);
+  }
+
+  // Most recent (highest #) first, so the annotation leads with the freshest
+  // application rather than whichever row happened to parse first.
+  for (const entry of entries.values()) entry.rows.sort((a, b) => b.num - a.num);
+  return entries;
+}
+
+/**
+ * Build the note-segment label for a prior-application match, or null if the
+ * company has no tracker history. Shared by scan.mjs's inline per-job loop
+ * and scan-ats-full.mjs's array-based annotator so the wording never drifts
+ * between the two scanners.
+ *
+ * @param {string} company - Company name as reported by the provider.
+ * @param {Map} appliedCompanies - From loadAppliedCompanies().
+ * @returns {string|null}
+ */
+export function priorApplicationLabel(company, appliedCompanies) {
+  if (!appliedCompanies || appliedCompanies.size === 0) return null;
+  const entry = appliedCompanies.get(normalizeCompany(company || ''));
+  if (!entry || entry.rows.length === 0) return null;
+  const latest = entry.rows[0];
+  const count = entry.rows.length > 1 ? ` (${entry.rows.length} total)` : '';
+  const status = latest.status ? `, ${latest.status}` : '';
+  const reportNums = extractTrackerReportNumbers(latest.report);
+  const report = reportNums.length > 0 ? `, report #${reportNums[0]}` : '';
+  return `prior application on file${count}: ${latest.role || 'role unknown'}${status}${report}`;
+}
+
 // ── Scan-run persistence (#1604) ────────────────────────────────────
 
 // Anchored for the same reason (#3510), and with a reader to agree with:
@@ -3030,6 +3101,10 @@ async function main() {
   // empty Map = the filter below never fires.
   const blacklist = loadBlacklist();
 
+  // 3.6. Load prior-application history from the tracker, if one exists.
+  // Never filters — only annotates (see loadAppliedCompanies() above).
+  const appliedCompanies = loadAppliedCompanies();
+
   // 4. Load dedup sets — one read per source file for the whole run (#2382).
   const historyPolicy = scanHistoryPolicy(config);
   const canonicalizeCompany = buildCompanyCanonicalizer(config.company_aliases);
@@ -3061,6 +3136,7 @@ async function main() {
   let totalFilteredCountryEligibility = 0;
   let totalFilteredBlacklist = 0;
   let annotatedBlacklisted = 0;
+  let annotatedPriorApplication = 0;
   let totalFilteredVisa = 0;
   let totalDupes = 0;
   const newOffers = [];
@@ -3164,6 +3240,20 @@ async function main() {
             job.note = typeof job.note === 'string' && job.note.trim()
               ? `${label} — ${job.note}`
               : label;
+          }
+        }
+
+        // Prior-application cross-check — informational only, never drops a
+        // posting (see loadAppliedCompanies() for why: a second req at a
+        // company you've applied to before is still often worth pursuing).
+        if (appliedCompanies.size > 0) {
+          const priorLabel = priorApplicationLabel(job.company || company.name, appliedCompanies);
+          if (priorLabel) {
+            annotatedPriorApplication++;
+            job.priorApplication = true;
+            job.note = typeof job.note === 'string' && job.note.trim()
+              ? `${priorLabel} — ${job.note}`
+              : priorLabel;
           }
         }
 
@@ -3423,6 +3513,9 @@ async function main() {
       console.log(`Blacklisted:           ${totalFilteredBlacklist} skipped (blacklist)`);
     }
   }
+  if (appliedCompanies.size > 0 && annotatedPriorApplication > 0) {
+    console.log(`Prior application:     ${annotatedPriorApplication} annotated (see note: in pipeline.md)`);
+  }
   if (crossListings.length > 0) {
     console.log(`\n⚠️  Possible cross-listings (same JD text, different company) — warn only, nothing was dropped:`);
     for (const { offer, row, score } of crossListings) {
@@ -3555,7 +3648,8 @@ async function main() {
         ? ` [Trust: ${o.trustScore}/100${o.trustFlags?.length ? ' — ' + o.trustFlags.join(', ') : ''}]`
         : '';
       const blacklistSuffix = o.blacklisted ? ' [BLACKLISTED — on your do-not-apply list]' : '';
-      console.log(`  + ${o.company} | ${o.title} | ${o.location || 'N/A'}${trustSuffix}${blacklistSuffix}`);
+      const priorApplicationSuffix = o.priorApplication ? ' [PRIOR APPLICATION — see note]' : '';
+      console.log(`  + ${o.company} | ${o.title} | ${o.location || 'N/A'}${trustSuffix}${blacklistSuffix}${priorApplicationSuffix}`);
     }
     if (dryRun) {
       console.log('\n(dry run — run without --dry-run to save results)');

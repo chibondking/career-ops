@@ -1,0 +1,1 @@
+../../../.agents/skills/career-scan-mine/SKILL.md

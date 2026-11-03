@@ -20,6 +20,28 @@ from the main `career-ops` skill/router so it isn't touched by
 (no `cv.md`, `config/profile.yml`, or tracker required -- this repo is used
 here purely as a sourcing feed).
 
+## Branch workflow (read first, on any machine)
+
+This skill and the prior-application annotation in `scan.mjs` /
+`scan-ats-full.mjs` live **only on branch `my-scan-mine`** of the fork
+(`origin`). `main` is a pure mirror of `upstream/main` and must never carry
+personal commits. If it does, the fork sync can't fast-forward.
+
+- **Run scans from `my-scan-mine`.** If this file is missing, you're on
+  `main`: `git switch my-scan-mine`.
+- **Commit personal changes to `my-scan-mine`**, never to `main`.
+- **After syncing `main` from upstream**, bring the branch up to date:
+  `git switch my-scan-mine && git rebase main && git push --force-with-lease origin my-scan-mine`.
+  Past conflicts were in the `scan.mjs` / `scan-ats-full.mjs` imports and
+  the per-job filter loop. Keep upstream's code and add the annotation
+  alongside it, then run `node --test tests/scan*.test.mjs`.
+- **One-time migration on a machine that still has the old personal commits
+  on `main`** (as of 2026-11-03, `origin/main` was force-moved to upstream).
+  Run `git fetch origin upstream`. Check that `git log origin/main..main`
+  shows only the two old personal commits, which already exist rebased on
+  `my-scan-mine`. Then run `git switch my-scan-mine` (tracking
+  `origin/my-scan-mine`) and `git branch -f main origin/main`.
+
 ## Project Root Resolution
 
 Start at this file's directory and walk upward until the nearest directory

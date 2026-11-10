@@ -37,7 +37,8 @@ personal commits. If it does, the fork sync can't fast-forward.
   alongside it, then run `node --test tests/scan*.test.mjs`.
 - **One-time migration on a machine that still has the old personal commits
   on `main`** (as of 2026-11-03, `origin/main` was force-moved to upstream).
-  Run `git fetch origin upstream`. Check that `git log origin/main..main`
+  Run `git fetch --multiple origin upstream` (without `--multiple`, git
+  treats `upstream` as a branch name on `origin` and fails). Check that `git log origin/main..main`
   shows only the two old personal commits, which already exist rebased on
   `my-scan-mine`. Then run `git switch my-scan-mine` (tracking
   `origin/my-scan-mine`) and `git branch -f main origin/main`.
